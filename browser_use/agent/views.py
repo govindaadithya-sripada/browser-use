@@ -96,6 +96,7 @@ class ActionResult(BaseModel):
 	extracted_content: Optional[str] = None
 	error: Optional[str] = None
 	include_in_memory: bool = False  # whether to include in past messages as context or not
+	has_step_passed: Optional[bool] = False  # whether the step was successful or not
 
 
 class StepMetadata(BaseModel):
@@ -343,10 +344,30 @@ class AgentHistoryList(BaseModel):
 		return outputs
 
 	def action_results(self) -> list[ActionResult]:
-		"""Get all results from history"""
+		"""Get all results from history and compute 'Passed' status"""
 		results = []
+		
 		for h in self.history:
-			results.extend([r for r in h.result if r])
+			for r in h.result:
+				if r.extracted_content and isinstance(r.extracted_content, str):
+					cleaned_content = r.extracted_content.strip().lower()
+					
+					# Define failure keywords
+					invalid_keywords = {"error", "failed", "unable", "unsuccessful", 
+										"unavailable", "crash", "invalid", "terminated",
+										"not found", "not available", "not working", "aborting", "does not match",
+										"does not contain", "does not exist", "does not work", "does not load"}
+					
+					# If any invalid keyword is found, mark as failed
+					has_passed = not any(word in cleaned_content for word in invalid_keywords)
+					
+					# Update the ActionResult object before appending
+					r.has_step_passed = has_passed
+					
+					print(f"Step Content: {r.extracted_content} -> Passed: {has_passed}")  # Debug output
+				
+				results.append(r)
+
 		return results
 
 	def extracted_content(self) -> list[str]:
