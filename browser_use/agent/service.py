@@ -37,10 +37,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel, Field, ValidationError
 from bs4 import BeautifulSoup
 
-from browser_use.agent.message_manager.service import (
-	MessageManager,
-	convert_input_messages,
-)
+from browser_use.agent.message_manager.service import MessageManager
+from browser_use.agent.message_manager.utils import convert_input_messages
 from browser_use.agent.prompts import GIF_GENERATOR_SYSTEM_PROMPT
 from browser_use.agent.views import AgentResults, AgentSettings, AgentState
 from browser_use.browser.browser import Browser
