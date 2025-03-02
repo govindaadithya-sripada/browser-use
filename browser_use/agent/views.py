@@ -75,13 +75,18 @@ class AgentState(BaseModel):
 	"""Holds all state information for an Agent"""
 
 	agent_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+	browser_session_id: Optional[str] = None
 	n_steps: int = 1
 	consecutive_failures: int = 0
 	last_result: Optional[List['ActionResult']] = None
+	last_action: Optional[Dict[str, Any]] = None
 	history: AgentHistoryList = Field(default_factory=lambda: AgentHistoryList(history=[]))
 	last_plan: Optional[str] = None
 	paused: bool = False
 	stopped: bool = False
+	done: bool = False
+	web_actions: int = 0
+	proposed_follow_up_tasks: Optional[List[Dict[str, Any]]] = None
 
 	message_manager_state: MessageManagerState = Field(default_factory=MessageManagerState)
 
