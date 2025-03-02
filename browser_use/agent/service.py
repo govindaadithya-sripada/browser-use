@@ -39,7 +39,6 @@ from bs4 import BeautifulSoup
 
 from browser_use.agent.message_manager.service import MessageManager
 from browser_use.agent.message_manager.utils import convert_input_messages
-from browser_use.agent.prompts import GIF_GENERATOR_SYSTEM_PROMPT
 from browser_use.agent.views import AgentResults, AgentSettings, AgentState
 from browser_use.browser.browser import Browser
 from browser_use.utils import extract_json_from_model_output, time_execution_async
@@ -754,7 +753,7 @@ Extracted links:
 						await generate_gif(self.browser.page, fp, 500, 50)
 
 						# Add image to state
-						message = GIF_GENERATOR_SYSTEM_PROMPT.format(path=fp)
+						message = f"Generated GIF saved to {fp}"
 						self.state.history.add_execution_info_message(message)
 					except Exception as e:
 						logger.error(f'Error generating GIF: {e}')

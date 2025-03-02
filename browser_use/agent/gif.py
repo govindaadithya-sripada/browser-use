@@ -5,6 +5,8 @@ import io
 import logging
 import os
 import platform
+import tempfile
+import time
 from typing import TYPE_CHECKING, Optional
 
 from browser_use.agent.views import (
@@ -13,8 +15,48 @@ from browser_use.agent.views import (
 
 if TYPE_CHECKING:
 	from PIL import Image, ImageFont
-
+    
 logger = logging.getLogger(__name__)
+
+async def generate_gif(page, output_path, duration=500, frames=20):
+    """Generate a GIF from a page."""
+    logger.info(f'Generating GIF for {page.url}')
+    try:
+        from PIL import Image
+        
+        # Capture a series of screenshots
+        screenshots = []
+        for _ in range(frames):
+            # Capture screenshot
+            screenshot_bytes = await page.screenshot({'type': 'jpeg', 'quality': 80})
+            img = Image.open(io.BytesIO(screenshot_bytes))
+            screenshots.append(img)
+            # Scroll down a bit
+            await page.evaluate('window.scrollBy(0, 100)')
+            # Wait a bit
+            await page.wait_for_timeout(100)
+        
+        # Save the GIF
+        if screenshots:
+            screenshots[0].save(
+                output_path,
+                save_all=True,
+                append_images=screenshots[1:],
+                optimize=False,
+                duration=duration,
+                loop=0
+            )
+            logger.info(f'Created GIF at {output_path}')
+        else:
+            logger.warning('No screenshots captured for GIF')
+    except Exception as e:
+        logger.error(f'Failed to generate GIF: {e}')
+        raise e
+
+def get_gif_fp():
+    """Get a path for a GIF file."""
+    temp_dir = tempfile.gettempdir()
+    return os.path.join(temp_dir, f'generated_{int(time.time())}.gif')
 
 
 def create_history_gif(
