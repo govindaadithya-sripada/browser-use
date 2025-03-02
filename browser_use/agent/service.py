@@ -50,10 +50,8 @@ logger = logging.getLogger('browser_use.agent')
 Context = TypeVar('Context')
 
 
-async def _unpack_task_or_url_task(task: Optional[str], url: Optional[str]) -> str:
-	"""Unpacks a task or a url into a task"""
-	# just to document the API
-
+def _unpack_task_or_url_task_sync(task: Optional[str], url: Optional[str]) -> str:
+	"""Unpacks a task or a url into a task (synchronous version)"""
 	if not task and not url:
 		raise ValueError('Either task or url must be specified')
 
@@ -65,6 +63,11 @@ async def _unpack_task_or_url_task(task: Optional[str], url: Optional[str]) -> s
 		return f'Visit {url} and extract its main content'
 
 	return task or ''
+
+async def _unpack_task_or_url_task(task: Optional[str], url: Optional[str]) -> str:
+	"""Unpacks a task or a url into a task (async version)"""
+	# Same logic as the sync version, but async for compatibility
+	return _unpack_task_or_url_task_sync(task, url)
 
 
 class Agent(Generic[Context]):
@@ -132,7 +135,8 @@ class Agent(Generic[Context]):
 		"""Initialize the agent"""
 		del additional_models
 
-		task = asyncio.run(_unpack_task_or_url_task(task, url))
+		# Use the synchronous version to avoid asyncio.run() issues inside an event loop
+		task = _unpack_task_or_url_task_sync(task, url)
 
 		self.model_name = None if not llm else llm.model_name
 
