@@ -58,6 +58,9 @@ class AgentSettings(BaseModel):
 	page_extraction_llm: Optional[BaseChatModel] = None
 	planner_llm: Optional[BaseChatModel] = None
 	planner_interval: int = 1  # Run planner every N steps
+	cloudverse_endpoint: Optional[str] = None  # Optional cloudverse API endpoint URL
+	use_cloudverse: bool = False  # Flag to use cloudverse instead of default LLM
+	cloudverse_api_key: Optional[str] = None  # API key for cloudverse authentication
 
 
 class AgentState(BaseModel):

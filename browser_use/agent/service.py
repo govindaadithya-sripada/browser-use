@@ -124,6 +124,9 @@ class Agent(Generic[Context]):
 		page_extraction_llm: Optional[BaseChatModel] = None,
 		planner_llm: Optional[BaseChatModel] = None,
 		planner_interval: int = 1,  # Run planner every N steps
+		cloudverse_endpoint: Optional[str] = None,  # Optional cloudverse API endpoint URL
+		use_cloudverse: bool = False,  # Flag to use cloudverse instead of default LLM
+		cloudverse_api_key: Optional[str] = None,  # API key for cloudverse authentication
 		# Inject state
 		injected_agent_state: Optional[AgentState] = None,
 		#
@@ -158,6 +161,9 @@ class Agent(Generic[Context]):
 			page_extraction_llm=page_extraction_llm,
 			planner_llm=planner_llm,
 			planner_interval=planner_interval,
+			cloudverse_endpoint=cloudverse_endpoint,
+			use_cloudverse=use_cloudverse,
+			cloudverse_api_key=cloudverse_api_key,
 		)
 
 		# Initialize state
@@ -358,7 +364,7 @@ class Agent(Generic[Context]):
 			tokens = self._message_manager.state.history.current_tokens
 
 			try:
-				model_output = await self.get_next_action(input_messages)
+				model_output = await self.get_next_action(input_messages, self.settings.cloudverse_endpoint)
 
 				self.state.n_steps += 1
 
@@ -499,11 +505,85 @@ class Agent(Generic[Context]):
 			return input_messages
 
 	@time_execution_async('--get_next_action (agent)')
-	async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
-		"""Get next action from LLM based on current state"""
+	async def get_next_action(self, input_messages: list[BaseMessage], cloudverse_endpoint: Optional[str] = None) -> AgentOutput:
+		"""Get next action from LLM based on current state
+		
+		Args:
+			input_messages: List of messages to send to the LLM
+			cloudverse_endpoint: Optional cloudverse API endpoint to use instead of the default LLM
+		"""
 		input_messages = self._convert_input_messages(input_messages)
 
-		if self.tool_calling_method == 'raw':
+		# Check if we should use cloudverse based on the settings
+		if self.settings.use_cloudverse and self.settings.cloudverse_endpoint:
+			cloudverse_endpoint = self.settings.cloudverse_endpoint
+			cloudverse_api_key = self.settings.cloudverse_api_key
+			
+		if cloudverse_endpoint:
+			# Use the cloudverse endpoint instead of the standard LLM
+			import aiohttp
+			import json
+			
+			# Convert the input messages to the cloudverse API format
+			messages = []
+			for message in input_messages:
+				if isinstance(message, SystemMessage):
+					messages.append({"role": "system", "content": message.content})
+				elif isinstance(message, HumanMessage):
+					messages.append({"role": "user", "content": message.content})
+				elif isinstance(message, AIMessage):
+					messages.append({"role": "assistant", "content": message.content})
+			
+			# Extract system message for instructions
+			system_instructions = ""
+			for message in input_messages:
+				if isinstance(message, SystemMessage):
+					system_instructions = message.content
+					break
+					
+			# Prepare the API request payload
+			payload = {
+				"model": self.model_name,
+				"messages": messages,
+				"max_tokens": 2000,  # Default value, can be made configurable
+				"temperature": 0,    # Default value, can be made configurable
+				"top_p": 1,          # Default value, can be made configurable
+				"system_instructions": system_instructions
+			}
+			
+			try:
+				# Setup headers with API key if provided
+				headers = {}
+				if cloudverse_api_key:
+					headers["Authorization"] = f"Bearer {cloudverse_api_key}"
+				
+				async with aiohttp.ClientSession() as session:
+					async with session.post(cloudverse_endpoint, json=payload, headers=headers) as response:
+						if response.status != 200:
+							error_text = await response.text()
+							logger.error(f"Cloudverse API error ({response.status}): {error_text}")
+							raise ValueError(f"Cloudverse API returned error: {response.status}")
+							
+						response_data = await response.json()
+						
+						# Parse the model output based on the response format
+						if "choices" in response_data and len(response_data["choices"]) > 0:
+							content = response_data["choices"][0].get("message", {}).get("content", "")
+						else:
+							content = response_data.get("content", "")
+							
+						# Process the content to extract JSON
+						try:
+							parsed_json = extract_json_from_model_output(content)
+							parsed = self.AgentOutput(**parsed_json)
+						except (ValueError, ValidationError) as e:
+							logger.warning(f"Failed to parse cloudverse output: {content} {str(e)}")
+							raise ValueError("Could not parse cloudverse response.")
+			except Exception as e:
+				logger.error(f"Error calling cloudverse endpoint: {str(e)}")
+				raise e
+				
+		elif self.tool_calling_method == 'raw':
 			output = self.llm.invoke(input_messages)
 			# TODO: currently invoke does not return reasoning_content, we should override invoke
 			output.content = self._remove_think_tags(str(output.content))
@@ -725,7 +805,64 @@ class Agent(Generic[Context]):
 			reason: str
 
 		validator = self.llm.with_structured_output(ValidationResult, include_raw=True)
-		response: dict[str, Any] = await validator.ainvoke(msg)  # type: ignore
+		
+		# If cloudverse is enabled, use it for validation too
+		if self.settings.use_cloudverse and self.settings.cloudverse_endpoint:
+			# Setup headers with API key if provided
+			headers = {}
+			if self.settings.cloudverse_api_key:
+				headers["Authorization"] = f"Bearer {self.settings.cloudverse_api_key}"
+			
+			# Convert to standard messages format for cloudverse API
+			messages = []
+			for message in msg:
+				if isinstance(message, SystemMessage):
+					messages.append({"role": "system", "content": message.content})
+				elif isinstance(message, HumanMessage):
+					messages.append({"role": "user", "content": message.content})
+				elif isinstance(message, AIMessage):
+					messages.append({"role": "assistant", "content": message.content})
+			
+			import aiohttp
+			import json
+			
+			# Prepare the API request payload
+			payload = {
+				"model": self.model_name,
+				"messages": messages,
+				"max_tokens": 500,  # Default value for validation
+				"temperature": 0,
+				"top_p": 1,
+				"system_instructions": system_msg
+			}
+			
+			try:
+				async with aiohttp.ClientSession() as session:
+					async with session.post(self.settings.cloudverse_endpoint, json=payload, headers=headers) as response_http:
+						if response_http.status != 200:
+							error_text = await response_http.text()
+							logger.error(f"Cloudverse API error ({response_http.status}): {error_text}")
+							return True  # Default to valid on error
+							
+						response_data = await response_http.json()
+						
+						if "choices" in response_data and len(response_data["choices"]) > 0:
+							content = response_data["choices"][0].get("message", {}).get("content", "")
+						else:
+							content = response_data.get("content", "")
+							
+						try:
+							parsed_json = extract_json_from_model_output(content)
+							response = {"parsed": ValidationResult(**parsed_json)}
+						except Exception as e:
+							logger.warning(f"Failed to parse cloudverse validation response: {e}")
+							return True  # Default to valid on error
+			except Exception as e:
+				logger.error(f"Error validating with Cloudverse: {e}")
+				return True  # Default to valid on error
+		else:
+			response: dict[str, Any] = await validator.ainvoke(msg)  # type: ignore
+		
 		parsed: ValidationResult = response['parsed']
 		is_valid = parsed.is_valid
 		if not is_valid:

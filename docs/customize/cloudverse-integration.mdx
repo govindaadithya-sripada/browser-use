@@ -1,0 +1,142 @@
+# Cloudverse Integration
+
+This guide explains how to integrate browser-use with Cloudverse as an alternative to OpenAI or other LLMs.
+
+## Overview
+
+Browser-use now supports using Cloudverse as an alternative LLM provider. You can switch between your default LLM and Cloudverse by setting a few parameters when initializing the Agent.
+
+## Parameters
+
+The following parameters have been added to the `AgentSettings` class:
+
+- `use_cloudverse` (boolean): When set to `True`, the agent will use Cloudverse instead of the default LLM.
+- `cloudverse_endpoint` (string): The URL of the Cloudverse API endpoint (e.g., "https://cloudverse.freshworkscorp.com/api/chat").
+- `cloudverse_api_key` (string): API key for Cloudverse authentication.
+
+## Agent Initialization Example
+
+```python
+from browser_use.agent.service import Agent
+from langchain_openai import ChatOpenAI  # Your default LLM
+
+# Initialize the agent with Cloudverse support
+agent = Agent(
+    task="Visit example.com and extract the main title",
+    llm=ChatOpenAI(),  # Your default LLM (required but will be bypassed when use_cloudverse=True)
+    use_cloudverse=True,  # Set to True to use Cloudverse
+    cloudverse_endpoint="https://cloudverse.freshworkscorp.com/api/chat",
+    cloudverse_api_key="your-api-key",
+    # ... other agent parameters
+)
+
+# Run the agent with Cloudverse
+result = await agent.run()
+```
+
+## FastAPI Integration
+
+To integrate this functionality with a FastAPI wrapper, you can add options to your API endpoints that allow clients to choose between the default LLM and Cloudverse.
+
+### Example FastAPI Implementation
+
+Here's how you could implement this in a FastAPI application:
+
+```python
+from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
+from browser_use.agent.service import Agent
+from typing import Optional, Dict, Any
+
+app = FastAPI()
+
+@app.post("/run_task")
+async def run_task(
+    background_tasks: BackgroundTasks,
+    task_data: Dict[str, Any] = Body(
+        ...,
+        example={
+            "task": "Visit example.com and extract the main title",
+            "url": "https://example.com",
+            "llm_provider": "cloudverse",  # Options: "default", "cloudverse"
+            "cloudverse_config": {
+                "endpoint": "https://cloudverse.freshworkscorp.com/api/chat",
+                "api_key": "your-api-key"
+            }
+        }
+    )
+):
+    # Extract configuration
+    task = task_data.get("task")
+    if not task:
+        raise HTTPException(status_code=400, detail="Task description is required")
+    
+    url = task_data.get("url")
+    llm_provider = task_data.get("llm_provider", "default")
+    
+    # Initialize LLM (this will be your default LLM)
+    llm = ChatOpenAI()
+    
+    # Configure agent based on selected provider
+    agent_kwargs = {
+        "task": task,
+        "llm": llm,
+    }
+    
+    if llm_provider == "cloudverse":
+        cloudverse_config = task_data.get("cloudverse_config", {})
+        if not cloudverse_config.get("endpoint"):
+            raise HTTPException(status_code=400, detail="Cloudverse endpoint is required")
+            
+        agent_kwargs.update({
+            "use_cloudverse": True,
+            "cloudverse_endpoint": cloudverse_config.get("endpoint"),
+            "cloudverse_api_key": cloudverse_config.get("api_key")
+        })
+    
+    # Create and run agent
+    try:
+        agent = Agent(**agent_kwargs)
+        
+        # Run in background and return task ID
+        task_id = str(uuid.uuid4())
+        background_tasks.add_task(execute_task, agent, task_id)
+        
+        return {
+            "task_id": task_id,
+            "status": "running",
+            "llm_provider": llm_provider
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start task: {str(e)}")
+
+async def execute_task(agent, task_id):
+    # Run the agent and store results
+    results = await agent.run()
+    # Store results for later retrieval...
+```
+
+## Cloudverse API Format
+
+The Cloudverse API expects requests in the following format:
+
+```json
+{
+  "model": "<API Model Name>",
+  "messages": [{
+        "content": "Your message here",
+        "role": "user"
+    }],
+  "max_tokens": 150,
+  "temperature": 0,
+  "top_p": 1,
+  "system_instructions": "You are an AI assistant that helps people find information."
+}
+```
+
+And should include the authorization header:
+
+```
+Authorization: Bearer <your-api-key>
+```
+
+Browser-use will automatically handle the conversion between message formats.
