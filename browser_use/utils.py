@@ -1,9 +1,27 @@
+import json
 import logging
 import time
 from functools import wraps
 from typing import Any, Callable, Coroutine, ParamSpec, TypeVar
 
 logger = logging.getLogger(__name__)
+
+
+def extract_json_from_model_output(content: str) -> dict:
+    """Extract JSON from model output, handling both plain JSON and code-block-wrapped JSON."""
+    try:
+        # If content is wrapped in code blocks, extract just the JSON part
+        if '```' in content:
+            # Find the JSON content between code blocks
+            content = content.split('```')[1]
+            # Remove language identifier if present (e.g., 'json\n')
+            if '\n' in content:
+                content = content.split('\n', 1)[1]
+        # Parse the cleaned content
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.warning(f'Failed to parse model output: {content} {str(e)}')
+        raise ValueError('Could not parse response.')
 
 
 # Define generic type variables for return type and parameters

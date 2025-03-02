@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Type
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
 from openai import RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
@@ -20,6 +21,13 @@ from browser_use.dom.history_tree_processor.service import (
 	HistoryTreeProcessor,
 )
 from browser_use.dom.views import SelectorMap
+
+
+class AgentResults(BaseModel):
+    """Results from the agent"""
+    final_answer: str
+    follow_up_tasks: list[dict[str, Any]]
+    message_history: Any
 
 ToolCallingMethod = Literal['function_calling', 'json_mode', 'raw', 'auto']
 
