@@ -61,6 +61,20 @@ class AgentSettings(BaseModel):
 		'aria-expanded',
 	]
 	max_actions_per_step: int = 10
+	max_steps: Optional[int] = None  # Maximum number of steps to execute
+	valid_urls: Optional[List[str]] = None  # List of allowed URL patterns
+	excluded_actions: Optional[List[str]] = None  # List of action types to exclude
+	maximum_web_actions: Optional[int] = None  # Maximum number of web actions
+	task: Optional[str] = None  # The task to perform
+	system_prompt: Optional[str] = None  # System prompt
+	user_agent: Optional[str] = None  # Custom user agent
+	initial_actions: Optional[list[dict[str, Any]]] = None  # Initial actions to execute
+	task_callback: Optional[Any] = None  # Callback when task is done
+	follow_up_task_callback: Optional[Any] = None  # Callback for follow-up tasks
+	conversation_saved_callback: Optional[Any] = None  # Callback when conversation is saved
+	show_progress: bool = False  # Whether to show progress
+	show_data_collection: bool = False  # Whether to show data collection
+	show_debug_completion: bool = False  # Whether to show debug completion
 
 	tool_calling_method: Optional[ToolCallingMethod] = 'auto'
 	page_extraction_llm: Optional[BaseChatModel] = None

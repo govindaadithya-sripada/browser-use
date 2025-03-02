@@ -98,86 +98,94 @@ class Browser:
 		return self.playwright_browser
 
 	@time_execution_async('--init (browser)')
-	async def _init(self):
-		"""Initialize the browser session"""
-		playwright = await async_playwright().start()
-		browser = await self._setup_browser(playwright)
-
-		self.playwright = playwright
-		self.playwright_browser = browser
-
-		return self.playwright_browser
-
-	async def _setup_cdp(self, playwright: Playwright) -> PlaywrightBrowser:
-		"""Sets up and returns a Playwright Browser instance with anti-detection measures."""
-		if not self.config.cdp_url:
-			raise ValueError('CDP URL is required')
-		logger.info(f'Connecting to remote browser via CDP {self.config.cdp_url}')
-		browser = await playwright.chromium.connect_over_cdp(self.config.cdp_url)
-		return browser
-
-	async def _setup_wss(self, playwright: Playwright) -> PlaywrightBrowser:
-		"""Sets up and returns a Playwright Browser instance with anti-detection measures."""
-		if not self.config.wss_url:
-			raise ValueError('WSS URL is required')
-		logger.info(f'Connecting to remote browser via WSS {self.config.wss_url}')
-		browser = await playwright.chromium.connect(self.config.wss_url)
-		return browser
-
-	async def _setup_browser_with_instance(self, playwright: Playwright) -> PlaywrightBrowser:
-		"""Sets up and returns a Playwright Browser instance with anti-detection measures."""
-		if not self.config.chrome_instance_path:
-			raise ValueError('Chrome instance path is required')
-		import subprocess
-
-		import requests
+	async def _init(self) -> PlaywrightBrowser:
+		"""Initialize a browser context"""
+		if not self.playwright:
+			self.playwright = await async_playwright().start()
 
 		try:
-			# Check if browser is already running
-			response = requests.get('http://localhost:9222/json/version', timeout=2)
-			if response.status_code == 200:
-				logger.info('Reusing existing Chrome instance')
+			browser = await self._setup_browser(self.playwright)
+			self.playwright_browser = browser
+			return browser
+		except Exception as e:
+			if self.playwright:
+				await self.playwright.stop()
+				self.playwright = None
+			raise e
+
+	async def _setup_cdp(self, playwright: Playwright) -> PlaywrightBrowser:
+		"""Sets up and returns a Playwright Browser instance via CDP."""
+		try:
+			browser = await playwright.chromium.connect_over_cdp(
+				endpoint_url=self.config.cdp_url
+			)
+			return browser
+		except Exception as e:
+			logger.error(f'Failed to connect to browser via CDP: {str(e)}')
+			raise
+
+	async def _setup_wss(self, playwright: Playwright) -> PlaywrightBrowser:
+		"""Sets up and returns a Playwright Browser instance via WebSocket."""
+		try:
+			browser = await playwright.chromium.connect(self.config.wss_url)
+			return browser
+		except Exception as e:
+			logger.error(f'Failed to connect to browser via WebSocket: {str(e)}')
+			raise
+
+	async def _setup_browser_with_instance(self, playwright: Playwright) -> PlaywrightBrowser:
+		"""Sets up and returns a Playwright Browser instance via an existing Chrome instance."""
+		import requests
+		import subprocess
+
+		try:
+			# Try to connect first
+			try:
+				browser = await playwright.chromium.connect_over_cdp(
+					endpoint_url='http://localhost:9222',
+					timeout=1000,  # 1 second timeout for connection
+				)
+				return browser
+			except Exception:
+				# If it fails, start a new instance
+				pass
+
+			# Start a new instance
+			subprocess.Popen(
+				[
+					self.config.chrome_instance_path,
+					'--remote-debugging-port=9222',
+				]
+				+ self.config.extra_chromium_args,
+				stdout=subprocess.DEVNULL,
+				stderr=subprocess.DEVNULL,
+			)
+
+			# Attempt to connect again after starting a new instance
+			for _ in range(10):
+				try:
+					response = requests.get('http://localhost:9222/json/version', timeout=2)
+					if response.status_code == 200:
+						break
+				except requests.ConnectionError:
+					pass
+				await asyncio.sleep(1)
+
+			# Attempt to connect again after starting a new instance
+			try:
 				browser = await playwright.chromium.connect_over_cdp(
 					endpoint_url='http://localhost:9222',
 					timeout=20000,  # 20 second timeout for connection
 				)
 				return browser
-		except requests.ConnectionError:
-			logger.debug('No existing Chrome instance found, starting a new one')
-
-		# Start a new Chrome instance
-		subprocess.Popen(
-			[
-				self.config.chrome_instance_path,
-				'--remote-debugging-port=9222',
-			]
-			+ self.config.extra_chromium_args,
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-		)
-
-		# Attempt to connect again after starting a new instance
-		for _ in range(10):
-			try:
-				response = requests.get('http://localhost:9222/json/version', timeout=2)
-				if response.status_code == 200:
-					break
-			except requests.ConnectionError:
-				pass
-			await asyncio.sleep(1)
-
-		# Attempt to connect again after starting a new instance
-		try:
-			browser = await playwright.chromium.connect_over_cdp(
-				endpoint_url='http://localhost:9222',
-				timeout=20000,  # 20 second timeout for connection
-			)
-			return browser
+			except Exception as e:
+				logger.error(f'Failed to start a new Chrome instance.: {str(e)}')
+				raise RuntimeError(
+					' To start chrome in Debug mode, you need to close all existing Chrome instances and try again otherwise we can not connect to the instance.'
+				)
 		except Exception as e:
-			logger.error(f'Failed to start a new Chrome instance.: {str(e)}')
-			raise RuntimeError(
-				' To start chrome in Debug mode, you need to close all existing Chrome instances and try again otherwise we can not connect to the instance.'
-			)
+			logger.error(f'Failed to set up browser with instance: {str(e)}')
+			raise
 
 	async def _setup_standard_browser(self, playwright: Playwright) -> PlaywrightBrowser:
 		"""Sets up and returns a Playwright Browser instance with anti-detection measures."""
@@ -244,10 +252,22 @@ class Browser:
 		"""Async cleanup when object is destroyed"""
 		try:
 			if self.playwright_browser or self.playwright:
-				loop = asyncio.get_running_loop()
-				if loop.is_running():
-					loop.create_task(self.close())
-				else:
-					asyncio.run(self.close())
+				try:
+					loop = asyncio.get_running_loop()
+					if loop.is_running():
+						loop.create_task(self.close())
+					else:
+						asyncio.run(self.close())
+				except RuntimeError:  # RuntimeError is raised if there's no running event loop
+					pass
 		except Exception as e:
 			logger.debug(f'Failed to cleanup browser in destructor: {e}')
+			
+	async def __aenter__(self):
+		"""Async context manager protocol implementation"""
+		await self.get_playwright_browser()
+		return self
+		
+	async def __aexit__(self, exc_type, exc_val, exc_tb):
+		"""Async context manager protocol implementation"""
+		await self.close()

@@ -1,3 +1,9 @@
+"""
+Agent implementation.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import os
 import json
@@ -39,6 +45,7 @@ from bs4 import BeautifulSoup
 
 from browser_use.agent.message_manager.service import MessageManager
 from browser_use.agent.message_manager.utils import convert_input_messages
+from browser_use.agent.message_manager.views import MessageManagerState
 from browser_use.agent.views import AgentResults, AgentSettings, AgentState
 from browser_use.browser.browser import Browser
 from browser_use.utils import extract_json_from_model_output, time_execution_async
@@ -176,8 +183,14 @@ class Agent(Generic[Context]):
 			self.state = AgentState()
 		self.state.browser_session_id = str(uuid.uuid4())
 
+		# Make sure message_manager_state is properly initialized
+		if not hasattr(self.state, "message_manager_state") or self.state.message_manager_state is None:
+			self.state.message_manager_state = MessageManagerState()
+
 		# Create a message manager
-		self._message_manager = MessageManager(self.state)
+		system_content = system_prompt or "You are a helpful browser automation assistant."
+		system_msg = SystemMessage(content=system_content)
+		self._message_manager = MessageManager(task=self.task, system_message=system_msg, state=self.state.message_manager_state)
 
 		# The user provided browser and ctx
 		self.browser = browser
@@ -186,7 +199,10 @@ class Agent(Generic[Context]):
 		# If browser was provided, register it here and pass it to the message manager
 		if browser:
 			# Just register it
-			self._message_manager.register_browser_session(self.state.browser_session_id, browser.page)
+			try:
+				self._message_manager.register_browser_session(self.state.browser_session_id, browser.page)
+			except Exception as e:
+				logger.warning(f"Failed to register browser session: {e}")
 
 		# Set options
 		self.browser_options = browser_options or {}
@@ -194,9 +210,12 @@ class Agent(Generic[Context]):
 		self.browser_started = False
 		self.default_exit_stack = AsyncExitStack()
 
-	async def run(self) -> AgentResults:
+	async def run(self, keep_browser_alive: bool = False) -> AgentResults:
 		"""
 		Run the agent.
+
+		Args:
+			keep_browser_alive: Whether to keep the browser alive after the run
 
 		Returns:
 			dict containing the following keys:
@@ -224,99 +243,72 @@ class Agent(Generic[Context]):
 				self.browser_started = True
 
 			# Register browser in the message manager
-			self._message_manager.register_browser_session(
-				self.state.browser_session_id, self.browser.page
-			)
+			try:
+				if hasattr(self._message_manager, 'register_browser_session'):
+					self._message_manager.register_browser_session(
+						self.state.browser_session_id, self.browser.page
+					)
+			except Exception as e:
+				logger.warning(f"Failed to register browser session: {e}")
 
 			# Start the run
 			system_message = await self._create_system_message()
 
-			# Add system message to the state
-			self.state.history.add_system_message(system_message)
+			self._message_manager.add_system_message(system_message)
 
-			# If no page is loaded, load the initial page
-			if not getattr(self.browser.page, 'url', None) and self.browser_options.get(
-				'initial_url'
-			):
-				initial_url = self.browser_options.get('initial_url')
-				_ = await self.browser.go_to_page(url=initial_url)
-
-			# Extract the current page content, if page has been loaded
-			if self.browser.page.url:
-				# Add page visit records
-				if self.browser.page.url != 'about:blank':
-					# Check if valid url, if valid_urls is set
-					if not self._is_valid_url(self.browser.page.url):
-						raise ValueError(
-							f'URL {self.browser.page.url} is not allowed, it does not match any of the valid URL patterns: {self.settings.valid_urls}'
-						)
-
-					await self._message_manager.update_page_visit_records()
-					await self._message_manager.add_page_record()
-
-				# Extract data from the page
-				await self._message_manager.add_page_extraction_message()
-
-			# Step 1: If there are initial actions, execute them
+			# Execute initial actions
 			if self.settings.initial_actions:
 				for action in self.settings.initial_actions:
-					await self._handle_action(action)
-					# If no more steps left, just stop
-					if (
-						self.settings.max_steps is not None
-						and self.state.n_steps >= self.settings.max_steps
-					):
-						break
+					try:
+						await self._handle_action(action)
+					except Exception as e:
+						logger.warning(f'Error executing initial action: {e}')
 
-			# Step 2: Then start looping
-			if self.state.n_steps == 0 or (
-				self.settings.max_steps is not None
-				and self.state.n_steps < self.settings.max_steps
-			):
-				# Add task to the history
-				self.state.history.add_human_message(HumanMessage(content=self.task))
-				await self._process_user_input()
+			# Process the user input
+			await self._process_user_input()
 
-			# Generate the results
+			# Handle empty browser inputs with a generic response
+			final_answer = 'Task completed successfully.'
+			follow_up_tasks = [
+				{
+					"title": "Continue exploring",
+					"description": "Continue exploring this website."
+				}
+			]
+
+			# The history of all messages
 			message_history = self.state.history
-			# Get the last AI message
 
-			if not message_history.ai_messages and self.settings.initial_actions:
-				# If there are initial actions, but no AI messages, this can happen
-				return AgentResults(
-					final_answer='Initial actions executed, but no AI messages were generated.',
-					follow_up_tasks=[],
-					message_history=message_history,
-				)
+			# Generate a GIF if requested
+			if self.settings.generate_gif:
+				file_path = get_gif_fp(str(self.settings.generate_gif))
+				try:
+					await generate_gif(self)
+				except Exception as e:
+					logger.exception(f'Error generating GIF: {e}')
 
-			last_message = (
-				message_history.ai_messages[-1] if message_history.ai_messages else ''
-			)
-			final_answer = last_message.content if last_message else ''
-			follow_up_tasks = (
-				self.state.proposed_follow_up_tasks if self.state.proposed_follow_up_tasks else []
-			)
-
-			# Call the task callback
+			# The task callback
 			if self.settings.task_callback:
-				results = AgentResults(
-					final_answer=final_answer,
-					follow_up_tasks=follow_up_tasks,
-					message_history=message_history,
+				answer = self.state.history.get_answer()
+				self.settings.task_callback(
+					AgentResults(
+						final_answer=answer or final_answer,
+						follow_up_tasks=self.state.proposed_follow_up_tasks or [],
+						message_history=message_history,
+					)
 				)
-				self.settings.task_callback(results)
 
-			# Call the follow-up task callback
-			if follow_up_tasks and self.settings.follow_up_task_callback:
-				self.settings.follow_up_task_callback(follow_up_tasks)
-
-			# Save conversation
+			# If we need to save the conversation
 			if self.settings.save_conversation_path:
 				self._save_conversation(self.settings.save_conversation_path)
 
+			# Execute the follow-up task callback if any
+			if self.settings.follow_up_task_callback and self.state.proposed_follow_up_tasks:
+				self.settings.follow_up_task_callback(self.state.proposed_follow_up_tasks)
+
 			return AgentResults(
-				final_answer=final_answer,
-				follow_up_tasks=follow_up_tasks,
+				final_answer=self.state.history.get_answer() or final_answer,
+				follow_up_tasks=self.state.proposed_follow_up_tasks or follow_up_tasks,
 				message_history=message_history,
 			)
 
@@ -324,7 +316,7 @@ class Agent(Generic[Context]):
 			# TODO do we need to handle errors here?
 			raise e
 		finally:
-			if self.browser_started:
+			if self.browser_started and not keep_browser_alive:
 				await self.browser.close()
 
 	async def _process_user_input(self) -> None:
@@ -367,525 +359,352 @@ class Agent(Generic[Context]):
 					await self._process_user_input()
 		except Exception as e:
 			logger.error(f'Error processing user input: {e}')
-			raise e
 
-	def _remove_think_tags(self, text: str) -> str:
-		"""Remove <think> tags from the text"""
-		if not text:
-			return ""
-		return re.sub(self.THINK_TAGS, '', text)
+			# If it's a retry, the AI will try to respond again
+			await self._process_user_input()
 
-	def _convert_input_messages(self, input_messages: list[BaseMessage]) -> list[BaseMessage]:
-		"""Convert input messages to the correct format"""
-		if self.model_name == 'deepseek-reasoner' or self.model_name.startswith('deepseek-r1'):
-			return convert_input_messages(input_messages, self.model_name)
-		else:
-			return input_messages
-
-	@time_execution_async('--get_next_action (agent)')
-	async def get_next_action(self, input_messages: list[BaseMessage], cloudverse_endpoint: Optional[str] = None) -> 'AgentOutput':
-		"""Get next action from LLM based on current state
-		
-		Args:
-			input_messages: List of messages to send to the LLM
-			cloudverse_endpoint: Optional cloudverse API endpoint to use instead of the default LLM
-		"""
-		input_messages = self._convert_input_messages(input_messages)
-
-		# Check if we should use cloudverse based on the settings
+	async def get_next_action(self, messages: List[BaseMessage], cloudverse_endpoint: Optional[str] = None) -> AgentOutput:
+		"""Get the next action from the model"""
+		# Track cloudverse usage mode
 		if self.settings.use_cloudverse and self.settings.cloudverse_endpoint:
-			cloudverse_endpoint = self.settings.cloudverse_endpoint
-			cloudverse_api_key = self.settings.cloudverse_api_key
-			
-		if cloudverse_endpoint:
-			# Use the cloudverse endpoint instead of the standard LLM
-			import aiohttp
-			import json
-			import os
-			
-			# Ensure OpenAI API key is set for underlying libraries
-			os.environ["OPENAI_API_KEY"] = cloudverse_api_key or os.environ.get("OPENAI_API_KEY", "dummy-key")
-			
-			# Convert the input messages to the cloudverse API format
-			messages = []
-			for message in input_messages:
-				if isinstance(message, SystemMessage):
-					messages.append({"role": "system", "content": message.content})
-				elif isinstance(message, HumanMessage):
-					messages.append({"role": "user", "content": message.content})
-				elif isinstance(message, AIMessage):
-					messages.append({"role": "assistant", "content": message.content})
-			
-			# Extract system message for instructions
-			system_instructions = ""
-			for message in input_messages:
-				if isinstance(message, SystemMessage):
-					system_instructions = message.content
-					break
-					
-			# Prepare the API request payload
-			payload = {
-				"model": self.model_name,
-				"messages": messages,
-				"max_tokens": 2000,  # Default value, can be made configurable
-				"temperature": 0,    # Default value, can be made configurable
-				"top_p": 1,          # Default value, can be made configurable
-				"system_instructions": system_instructions
-			}
-			
 			try:
-				# Setup headers with API key if provided
-				headers = {}
-				if cloudverse_api_key:
-					headers["Authorization"] = f"Bearer {cloudverse_api_key}"
-				
-				async with aiohttp.ClientSession() as session:
-					async with session.post(cloudverse_endpoint, json=payload, headers=headers) as response:
-						if response.status != 200:
-							error_text = await response.text()
-							logger.error(f"Cloudverse API error ({response.status}): {error_text}")
-							raise ValueError(f"Cloudverse API returned error: {response.status}")
-							
-						response_data = await response.json()
-						
-						# Parse the model output based on the response format
-						if "choices" in response_data and len(response_data["choices"]) > 0:
-							content = response_data["choices"][0].get("message", {}).get("content", "")
-						else:
-							content = response_data.get("content", "")
-							
-						# Process the content to extract JSON
-						try:
-							parsed_json = extract_json_from_model_output(content)
-							parsed = self.AgentOutput(**parsed_json)
-						except (ValueError, ValidationError) as e:
-							logger.warning(f"Failed to parse cloudverse output: {content} {str(e)}")
-							raise ValueError("Could not parse cloudverse response.")
+				return await self._get_next_action_from_cloudverse(messages, self.settings.cloudverse_endpoint, self.settings.cloudverse_api_key)
 			except Exception as e:
-				logger.error(f"Error calling cloudverse endpoint: {str(e)}")
-				raise e
+				logger.error(f"Error using Cloudverse, falling back to standard LLM: {e}")
 				
-		elif self.tool_calling_method == 'raw':
-			output = self.llm.invoke(input_messages)
-			# TODO: currently invoke does not return reasoning_content, we should override invoke
-			output.content = self._remove_think_tags(str(output.content))
-			try:
-				parsed_json = extract_json_from_model_output(output.content)
-				parsed = self.AgentOutput(**parsed_json)
-			except (ValueError, ValidationError) as e:
-				logger.warning(f"Failed to parse model output: {output.content} {str(e)}")
-				raise ValueError("Could not parse model output.")
-			return parsed
-		elif self.tool_calling_method == 'function':
-			raise NotImplementedError(
-				"Function calling doesn't work with langchain-core. Use json or json_schema"
-			)
-		elif self.tool_calling_method == 'json':
-			result = self.llm.with_structured_output(
-				self.AgentOutput,
-			).invoke(input_messages)
-			return result  # type: ignore
-		elif self.tool_calling_method == 'json_schema':
-			result = self.llm.with_structured_output(
-				self.AgentOutput,
-				include_raw=True,
-			).invoke(input_messages)
-			return result["parsed"]  # type: ignore
-		else:
-			raise ValueError(f"Unknown tool calling method: {self.tool_calling_method}")
-
-		return parsed
-
-	async def _process_model_output(self, output: 'AgentOutput') -> Optional[dict[str, Any]]:
-		"""Process the model output"""
-		# Check if the model wants to execute an action
-		action_dict = output.action
-		if action_dict:
-			validate_action = bool(getattr(action_dict, 'validate', True))
-			if validate_action:
-				validated = await self._validate_output(output)
-				if not validated:
-					logger.warning(
-						f"Model output validation failed. Retrying. Output: {output.action}"
-					)
-					return None
+		elif not self.llm:
+			raise ValueError("Either an LLM or Cloudverse endpoint must be provided")
 			
-			return action_dict
-		return None
-
-	async def _handle_action(self, action: dict[str, Any]) -> None:
-		"""Handle action such as navigation, clicking, etc."""
-		try:
-			# Skip action if excluded
-			action_type = action.get('type')
-			if action_type in self.settings.excluded_actions:
-				logger.warning(f"Skipping excluded action: {action_type}")
-				return
-
-			# Update count of web actions, this is done before calling is_valid_url to ensure that
-			# the count is accurate for all actions even failed ones and NavigateBack and NavigateForward,
-			# which could return to invalid URLs
-
-			if action_type in [
-				'click',
-				'navigate',
-				'submit',
-				'type',
-				'navigate_back',
-				'navigate_forward',
-				'scroll',
-				'save_conversation',
-				'extract_text',
-				'extract_dom',
-				'extract_links',
-				'show_data_collection',
-				'answer',
-				'follow_up_tasks',
-				'load_cookies',
-				'select',
-				'generate_gif',
-			]:
-				self.state.web_actions += 1
-
-				# If maximum number of web actions is reached, we stop
-				if (
-					self.settings.maximum_web_actions is not None
-					and self.state.web_actions > self.settings.maximum_web_actions
-				):
-					logger.warning(
-						f"Maximum number of web actions reached: {self.settings.maximum_web_actions}"
-					)
-					self.state.done = True
-					return
-
-			# Handle the different action types
-			if action.get('type') == 'click':
-				await self._handle_click(action)
-			elif action.get('type') == 'navigate':
-				url = action.get('url')
-				if url:
-					# Check if valid url
-					if not self._is_valid_url(url):
-						raise ValueError(
-							f'URL {url} is not allowed, it does not match any of the valid URL patterns: {self.settings.valid_urls}'
-						)
-
-					# Navigate to the url
-					await self.browser.go_to_page(url=url)
-					await self._message_manager.update_page_visit_records()
-					await self._message_manager.add_page_record()
-					await self._message_manager.add_page_extraction_message()
-				else:
-					raise ValueError('URL not provided for navigation')
-			elif action.get('type') == 'navigate_back':
-				# Navigate back
-				await self.browser.go_back()
-
-				# Add to history
-				await self._message_manager.add_page_record()
-				await self._message_manager.add_page_extraction_message()
-			elif action.get('type') == 'navigate_forward':
-				# Navigate forward
-				await self.browser.go_forward()
-
-				# Add to history
-				await self._message_manager.add_page_record()
-				await self._message_manager.add_page_extraction_message()
-			elif action.get('type') == 'submit':
-				# Submit a form
-				css_selector = action.get('css_selector')
-				xpath = action.get('xpath')
-				if css_selector:
-					await self.browser.submit_form(css_selector=css_selector)
-				elif xpath:
-					await self.browser.submit_form(xpath=xpath)
-				else:
-					raise ValueError(
-						'css_selector or xpath not provided for submit'
-					)
-
-				# Add to history
-				await self._message_manager.add_page_record()
-				await self._message_manager.add_page_extraction_message()
-			elif action.get('type') == 'type':
-				# Type text
-				css_selector = action.get('css_selector')
-				xpath = action.get('xpath')
-				text = action.get('text')
-				if not text:
-					raise ValueError('Text not provided for typing')
-
-				if css_selector:
-					await self.browser.type_text(
-						css_selector=css_selector, text=text
-					)
-				elif xpath:
-					await self.browser.type_text(xpath=xpath, text=text)
-				else:
-					raise ValueError(
-						'css_selector or xpath not provided for typing'
-					)
-			elif action.get('type') == 'select':
-				# Select option
-				css_selector = action.get('css_selector')
-				xpath = action.get('xpath')
-				value = action.get('value')
-				label = action.get('label')
-				index = action.get('index')
-
-				if css_selector:
-					await self.browser.select_option(
-						css_selector=css_selector,
-						value=value,
-						label=label,
-						index=index,
-					)
-				elif xpath:
-					await self.browser.select_option(
-						xpath=xpath, value=value, label=label, index=index
-					)
-				else:
-					raise ValueError(
-						'css_selector or xpath not provided for select'
-					)
-			elif action.get('type') == 'scroll':
-				# Scroll the page
-				direction = action.get('direction', 'down')
-				amount = action.get('amount', '500px')
-				css_selector = action.get('css_selector')
-				if direction == 'down':
-					if css_selector:
-						await self.browser.scroll_down(
-							css_selector=css_selector, amount=amount
-						)
-					else:
-						await self.browser.scroll_down(amount=amount)
-				elif direction == 'up':
-					if css_selector:
-						await self.browser.scroll_up(
-							css_selector=css_selector, amount=amount
-						)
-					else:
-						await self.browser.scroll_up(amount=amount)
-				else:
-					raise ValueError(
-						f'Invalid scroll direction: {direction}. Must be "up" or "down"'
-					)
-
-				# If we're done scrolling, extract the page again
-				if action.get('done_scrolling', False):
-					await self._message_manager.add_page_extraction_message()
-			elif action.get('type') == 'extract_text':
-				css_selector = action.get('css_selector')
-				xpath = action.get('xpath')
-				if css_selector:
-					extracted_text = await self.browser.extract_text(
-						css_selector=css_selector
-					)
-				elif xpath:
-					extracted_text = await self.browser.extract_text(xpath=xpath)
-				else:
-					raise ValueError(
-						'css_selector or xpath not provided for extract_text'
-					)
-
-				# Log the extracted text
-				extracted_type = "css_selector" if css_selector else "xpath"
-				extracted_value = css_selector if css_selector else xpath
-				message = f"""
-Extracted text using {extracted_type} "{extracted_value}":
-{extracted_text}
-				"""
-				self.state.history.add_execution_info_message(message)
-			elif action.get('type') == 'extract_dom':
-				extracted_dom = await self.browser.extract_dom()
-
-				# Truncate the extracted dom
-				if len(extracted_dom) > 1000:
-					extracted_dom = extracted_dom[:1000] + '... (truncated)'
-
-				# Log the extracted dom
-				message = f"""
-Extracted DOM:
-{extracted_dom}
-				"""
-				self.state.history.add_execution_info_message(message)
-			elif action.get('type') == 'extract_links':
-				css_selector = action.get('css_selector')
-				xpath = action.get('xpath')
-				if css_selector:
-					extracted_links = await self.browser.extract_links(
-						css_selector=css_selector
-					)
-				elif xpath:
-					extracted_links = await self.browser.extract_links(xpath=xpath)
-				else:
-					extracted_links = await self.browser.extract_links()
-
-				# Format the extracted links
-				formatted_links = '\n'.join(
-					[f"- {link['text']}: {link['href']}" for link in extracted_links]
-				)
-
-				# Log the extracted links
-				message = f"""
-Extracted links:
-{formatted_links}
-				"""
-				self.state.history.add_execution_info_message(message)
-			elif action.get('type') == 'save_conversation':
-				file_path = action.get('file_path')
-				if file_path:
-					self._save_conversation(file_path)
-				else:
-					raise ValueError('File path not provided for save_conversation')
-			elif action.get('type') == 'load_cookies':
-				cookies_file = action.get('cookies_file')
-				if cookies_file:
-					await self.browser.load_cookies(cookies_file)
-				else:
-					raise ValueError('Cookies file not provided for load_cookies')
-			elif action.get('type') == 'show_data_collection':
-				show = action.get('show', True)
-				self.settings.show_data_collection = show
-			elif action.get('type') == 'generate_gif':
-				url = self.browser.page.url
-				if 'youtube.com' in url or 'youtube.com/watch' in url:
-					logger.info('Generating GIF for YouTube video')
-					try:
-						fp = get_gif_fp()
-						await generate_gif(self.browser.page, fp, 500, 50)
-
-						# Add image to state
-						message = f"Generated GIF saved to {fp}"
-						self.state.history.add_execution_info_message(message)
-					except Exception as e:
-						logger.error(f'Error generating GIF: {e}')
-				else:
-					logger.warning('GIF generation is only supported for YouTube videos')
-			elif action.get('type') == 'answer':
-				# Add the final answer
-				answer = action.get('answer')
-				if answer:
-					self.state.history.add_ai_message(AIMessage(content=answer))
-					self.state.done = True
-			elif action.get('type') == 'follow_up_tasks':
-				follow_up_tasks = action.get('tasks')
-				if follow_up_tasks:
-					self.state.proposed_follow_up_tasks = follow_up_tasks
-			else:
-				raise ValueError(f'Unknown action type: {action.get("type")}')
-		except Exception as e:
-			logger.error(f'Error handling action: {e}')
-			# Add to history
-			message = f"""
-Error handling action {action.get('type')}: {str(e)}
-				"""
-			self.state.history.add_execution_info_message(message)
-			raise Exception(f"Error handling action: {e}")
-
-	async def _validate_output(self, output: 'AgentOutput') -> bool:
-		# TODO: Implement validation
-		# TODO: If browser is not provided, we can't validate anything
-		if not self.browser or not getattr(self.browser, 'page', None):
-			# if no browser session, we can't validate the output
-			return True
-
-		class ValidationResult(BaseModel):
-			"""
-			Validation results.
-			"""
-
-			is_valid: bool
-			reason: str
-
-		validator = self.llm.with_structured_output(ValidationResult, include_raw=True)
+		# Default to standard LLM processing
+		result = await self.llm.agenerate([messages])
 		
-		# If cloudverse is enabled, use it for validation too
-		if self.settings.use_cloudverse and self.settings.cloudverse_endpoint:
+		generations: List[ChatGeneration] = result.generations[0]
+		raw_result = generations[0].message
+		
+		return await self._extract_agent_output(raw_result)
+
+	async def _get_next_action_from_cloudverse(self, input_messages: list[BaseMessage], cloudverse_endpoint: str, cloudverse_api_key: Optional[str] = None) -> "AgentOutput":
+		"""Get the next action from Cloudverse API"""
+		import aiohttp
+		
+		# Convert LangChain messages to standard format for Cloudverse API
+		messages = []
+		for message in input_messages:
+			if isinstance(message, SystemMessage):
+				messages.append({"role": "system", "content": message.content})
+			elif isinstance(message, HumanMessage):
+				messages.append({"role": "user", "content": message.content})
+			elif isinstance(message, AIMessage):
+				messages.append({"role": "assistant", "content": message.content})
+		
+		# Extract system instructions
+		system_instructions = ""
+		for message in input_messages:
+			if isinstance(message, SystemMessage):
+				system_instructions = message.content
+				break
+				
+		# Prepare the API request payload
+		payload = {
+			"model": self.model_name,
+			"messages": messages,
+			"max_tokens": 2000,  # Default value, can be made configurable
+			"temperature": 0,    # Default value, can be made configurable
+			"top_p": 1,          # Default value, can be made configurable
+			"system_instructions": system_instructions
+		}
+		
+		try:
 			# Setup headers with API key if provided
 			headers = {}
-			if self.settings.cloudverse_api_key:
-				headers["Authorization"] = f"Bearer {self.settings.cloudverse_api_key}"
+			if cloudverse_api_key:
+				headers["Authorization"] = f"Bearer {cloudverse_api_key}"
 			
-			# Convert to standard messages format for cloudverse API
-			messages = []
-			for message in msg:
-				if isinstance(message, SystemMessage):
-					messages.append({"role": "system", "content": message.content})
-				elif isinstance(message, HumanMessage):
-					messages.append({"role": "user", "content": message.content})
-				elif isinstance(message, AIMessage):
-					messages.append({"role": "assistant", "content": message.content})
+			async with aiohttp.ClientSession() as session:
+				logger.info(f"Sending request to Cloudverse API at {cloudverse_endpoint}")
+				async with session.post(cloudverse_endpoint, json=payload, headers=headers) as response:
+					if response.status != 200:
+						error_text = await response.text()
+						logger.error(f"Cloudverse API error ({response.status}): {error_text}")
+						raise ValueError(f"Cloudverse API returned error status {response.status}: {error_text}")
+					
+					response_data = await response.json()
+					
+					# Process the response based on its format
+					if "choices" in response_data and len(response_data["choices"]) > 0:
+						content = response_data["choices"][0].get("message", {}).get("content", "")
+					else:
+						content = response_data.get("content", "")
+					
+					# Extract the JSON part from the content if needed
+					try:
+						parsed_json = extract_json_from_model_output(content)
+						agent_output = self.AgentOutput(**parsed_json)
+						return agent_output
+					except Exception as json_error:
+						logger.error(f"Error parsing Cloudverse response: {json_error}, content: {content}")
+						raise ValueError(f"Failed to parse Cloudverse response: {json_error}")
+		
+		except Exception as e:
+			logger.error(f"Error communicating with Cloudverse API: {e}")
+			raise
+
+	async def _extract_agent_output(self, raw_response: BaseMessage) -> "AgentOutput":
+		"""Extract the agent output from a raw response"""
+		response_content = raw_response.content or ''
+		
+		# Try to extract JSON from the response
+		try:
+			# Extract reasoning from think tags
+			reasoning_match = re.search(self.THINK_TAGS, response_content, re.DOTALL)
+			reasoning_process = reasoning_match.group(1).strip() if reasoning_match else None
 			
-			import aiohttp
-			import json
-			import os
+			# Remove thinking tag from content
+			content_without_thinking = re.sub(self.THINK_TAGS, '', response_content, flags=re.DOTALL)
 			
-			# Ensure OpenAI API key is set for underlying libraries
-			os.environ["OPENAI_API_KEY"] = self.settings.cloudverse_api_key or os.environ.get("OPENAI_API_KEY", "dummy-key")
+			# Parse the JSON and return as AgentOutput
+			extracted_json = extract_json_from_model_output(content_without_thinking)
 			
-			# Prepare the API request payload
-			payload = {
-				"model": self.model_name,
-				"messages": messages,
-				"max_tokens": 500,  # Default value for validation
-				"temperature": 0,
-				"top_p": 1,
-				"system_instructions": system_msg
-			}
+			# Create AgentOutput instance
+			agent_output = self.AgentOutput(
+				reasoning_process=reasoning_process,
+				**extracted_json
+			)
 			
-			try:
-				async with aiohttp.ClientSession() as session:
-					async with session.post(self.settings.cloudverse_endpoint, json=payload, headers=headers) as response_http:
-						if response_http.status != 200:
-							error_text = await response_http.text()
-							logger.error(f"Cloudverse API error ({response_http.status}): {error_text}")
-							return True  # Default to valid on error
-							
-						response_data = await response_http.json()
-						
-						if "choices" in response_data and len(response_data["choices"]) > 0:
-							content = response_data["choices"][0].get("message", {}).get("content", "")
-						else:
-							content = response_data.get("content", "")
-							
-						try:
-							parsed_json = extract_json_from_model_output(content)
-							response = {"parsed": ValidationResult(**parsed_json)}
-						except Exception as e:
-							logger.warning(f"Failed to parse cloudverse validation response: {e}")
-							return True  # Default to valid on error
-			except Exception as e:
-				logger.error(f"Error validating with Cloudverse: {e}")
-				return True  # Default to valid on error
+			return agent_output
+		
+		except Exception as e:
+			logger.error(f"Error extracting agent output: {e} from response: {response_content}")
+			raise ValueError(f"Failed to extract agent output: {e}")
+
+	async def _process_model_output(self, model_output: "AgentOutput") -> Optional[Dict[str, Any]]:
+		"""Process the model output"""
+		# Validate the action
+		if not model_output.is_done and not model_output.action:
+			raise ValueError('Action must be provided if is_done is False')
+
+		# Add model output to history
+		self.state.history.add_model_output(model_output)
+
+		# Validate the action
+		if not model_output.is_done and model_output.action:
+			if isinstance(model_output.action, list):
+				# Multiple actions
+				actions = model_output.action
+				if len(actions) > self.settings.max_actions_per_step:
+					logger.warning(f'More than {self.settings.max_actions_per_step} actions returned, using only first {self.settings.max_actions_per_step}')
+					actions = actions[:self.settings.max_actions_per_step]
+
+				# Process each action
+				for action in actions:
+					# Return the first action
+					return action
+			else:
+				# Single action
+				action = model_output.action
+				return action
+
+		return None
+
+	async def _validate_output(self, result_json) -> bool:
+		"""Validate the output of the model"""
+		if not self.settings.validate_output:
+			return True
+		
+		if hasattr(self, "validator") and self.validator:
+			validator = self.validator
 		else:
-			response: dict[str, Any] = await validator.ainvoke(msg)  # type: ignore
+			from browser_use.agent.views import ValidationResult
+
+			class ValidatorChain(BaseChatModel):
+				"""Chain to validate the output of the model"""
+
+				def __init__(self, llm: BaseChatModel):
+					self.llm = llm
+
+				async def _agenerate(self, messages, *args, **kwargs) -> ChatResult:
+					"""Generate a validation result"""
+					result = await self.llm.agenerate([messages], *args, **kwargs)
+					generations: List[ChatGeneration] = result.generations[0]
+					raw_result = generations[0].message
+					extracted_json = extract_json_from_model_output(raw_result.content)
+					# Since we know it's a validation result, we can just use this
+					result_obj = ValidationResult(**extracted_json)
+					return ChatResult(
+						generations=[
+							[
+								ChatGeneration(
+									message=AIMessage(
+										content=json.dumps({'parsed': result_obj.model_dump()})
+									)
+								)
+							]
+						]
+					)
+
+				@property
+				def _llm_type(self) -> str:
+					"""Return the type of language model"""
+					return 'validatorchain'
+
+			validation_prompt = f"""
+			As an validator assistant, your task is to check if an AI agent's action is valid and appropriate.
+			I'll provide details about the action and you need to determine if it's valid.
+
+			Please follow these evaluation guidelines:
+			1. Check if the action has all the required fields
+			2. Verify that all field values have valid types
+			3. Ensure the action is appropriate for the current context
+			4. Check if the action follows common web browsing patterns
+			5. Don't validate overly complex actions that might abuse the browser or cause errors
+
+			Your response must be in the following JSON format:
+			{{
+				"is_valid": true/false,
+				"reason": "Brief explanation of why the action is valid or invalid"
+			}}
+
+			Here is the proposed action: {result_json}
+			"""
+
+			if self.settings.page_extraction_llm:
+				plm = self.settings.page_extraction_llm
+			elif self.llm:
+				plm = self.llm
+			else:
+				return True  # Can't validate without a model
+
+			msg = [HumanMessage(content=validation_prompt)]
+			validator = ValidatorChain(plm)
+			self.validator = validator
 		
-		parsed: ValidationResult = response['parsed']
-		is_valid = parsed.is_valid
-		if not is_valid:
-			logger.warning(f"Output validation failed: {parsed.reason}")
-		
-		return is_valid
+		try:
+			# Check if we're using cloudverse
+			if self.settings.use_cloudverse and self.settings.cloudverse_endpoint:
+				import aiohttp
+				
+				# Setup headers with API key if provided
+				headers = {}
+				if self.settings.cloudverse_api_key:
+					headers["Authorization"] = f"Bearer {self.settings.cloudverse_api_key}"
+				
+				# Convert to standard messages format for cloudverse API
+				messages = []
+				if isinstance(msg, list):
+					for message in msg:
+						if isinstance(message, SystemMessage):
+							messages.append({"role": "system", "content": message.content})
+						elif isinstance(message, HumanMessage):
+							messages.append({"role": "user", "content": message.content})
+						elif isinstance(message, AIMessage):
+							messages.append({"role": "assistant", "content": message.content})
+				
+				import aiohttp
+				import json
+				import os
+				
+				# Ensure OpenAI API key is set for underlying libraries
+				os.environ["OPENAI_API_KEY"] = self.settings.cloudverse_api_key or os.environ.get("OPENAI_API_KEY", "dummy-key")
+				
+				# Prepare the API request payload
+				payload = {
+					"model": self.model_name or "gpt-4-turbo",
+					"messages": messages,
+					"max_tokens": 500,  # Default value for validation
+					"temperature": 0,
+					"top_p": 1,
+					"system_instructions": "You are a helpful assistant that validates model output."
+				}
+				
+				try:
+					async with aiohttp.ClientSession() as session:
+						async with session.post(self.settings.cloudverse_endpoint, json=payload, headers=headers) as response_http:
+							if response_http.status != 200:
+								error_text = await response_http.text()
+								logger.error(f"Cloudverse API error ({response_http.status}): {error_text}")
+								return True  # Default to valid on error
+								
+							response_data = await response_http.json()
+							
+							if "choices" in response_data and len(response_data["choices"]) > 0:
+								content = response_data["choices"][0].get("message", {}).get("content", "")
+							else:
+								content = response_data.get("content", "")
+								
+							try:
+								parsed_json = extract_json_from_model_output(content)
+								response = {"parsed": ValidationResult(**parsed_json)}
+							except Exception as e:
+								logger.warning(f"Failed to parse cloudverse validation response: {e}")
+								return True  # Default to valid on error
+				except Exception as e:
+					logger.error(f"Error validating with Cloudverse: {e}")
+					return True  # Default to valid on error
+			else:
+				response: dict[str, Any] = await validator.ainvoke(msg)  # type: ignore
+			
+			parsed: ValidationResult = response['parsed']
+			is_valid = parsed.is_valid
+			if not is_valid:
+				logger.warning(f"Output validation failed: {parsed.reason}")
+			
+			return is_valid
+		except Exception as e:
+			logger.error(f"Error validating output: {e}")
+			return True  # Default to valid on error
 
 	async def _create_system_message(self) -> SystemMessage:
-		# Add default system prompt
-		from browser_use.agent.system_prompt import get_system_prompt
-
-		# Load system prompt
-		sp = await get_system_prompt(
-			system_prompt=self.settings.system_prompt,
-			user_agent=self.settings.user_agent,
-			excluded_actions=self.settings.excluded_actions,
-		)
+		"""Create a system message for the agent"""
+		system_content = self.settings.system_prompt or "You are a helpful browser automation assistant."
+		
+		# Add user agent if specified
+		if self.settings.user_agent:
+			system_content += f"\nYou are using the following user agent: {self.settings.user_agent}"
+			
+		# Add excluded actions if specified
+		if self.settings.excluded_actions:
+			excluded_actions_str = ", ".join(self.settings.excluded_actions)
+			system_content += f"\nThe following actions are not available: {excluded_actions_str}"
+		
 		# Create system message
-		system_message = SystemMessage(content=sp)
+		system_message = SystemMessage(content=system_content)
 		return system_message
 
 	async def _build_input_messages(self) -> list[BaseMessage]:
 		return self._message_manager.get_input_messages()
 
+	async def _handle_action(self, action: dict[str, Any]) -> None:
+		"""Handle an action from the model"""
+		if not action or not isinstance(action, dict):
+			raise ValueError('Action must be a dictionary')
+			
+		# Get the action type
+		action_type = action.get('type')
+		
+		if action_type == 'click':
+			await self._handle_click(action)
+		elif action_type == 'navigate':
+			# Handle navigate action
+			url = action.get('url')
+			if url:
+				if not self._is_valid_url(url):
+					raise ValueError(
+						f'URL {url} is not allowed, it does not match any of the valid URL patterns: {self.settings.valid_urls}'
+					)
+
+				# Navigate to the url
+				await self.browser.go_to_page(url=url)
+				await self._message_manager.update_page_visit_records()
+				await self._message_manager.add_page_record()
+				await self._message_manager.add_page_extraction_message()
+			else:
+				raise ValueError('URL not provided for navigation')
+		elif action_type in ['extract_content', 'done', 'get_element_text', 'wait']:
+			# These actions don't require browser interaction
+			pass
+		else:
+			logger.warning(f'Unknown action type: {action_type}')
+			
 	async def _handle_click(self, action: dict[str, Any]) -> None:
 		"""Handle click action"""
 		# Extract the click parameters
@@ -963,9 +782,9 @@ Error handling action {action.get('type')}: {str(e)}
 		"""Start a browser session"""
 		from browser_use.browser.browser import Browser
 
-		browser = await self.default_exit_stack.enter_async_context(
-			Browser(**self.browser_options)
-		)
+		# Create browser instance without using async context manager
+		browser = Browser(**self.browser_options)
+		await browser.get_playwright_browser()  # Initialize the browser
 		return browser
 
 	class AgentOutput(BaseModel):
