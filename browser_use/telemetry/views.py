@@ -58,6 +58,11 @@ class AgentEndTelemetryEvent(BaseTelemetryEvent):
 	success: bool | None
 	total_input_tokens: int
 	total_duration_seconds: float
+	
+	# Cache metrics
+	cache_enabled: bool = False
+	cache_hits: int = 0
+	cache_misses: int = 0
 
 	errors: Sequence[str | None]
 	name: str = 'agent_end'

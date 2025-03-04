@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -54,6 +55,121 @@ from browser_use.utils import time_execution_async, time_execution_sync
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+class AgentCache:
+	"""Cache for storing and retrieving LLM responses to reduce duplicate calls.
+	
+	This cache stores responses from the LLM based on the input messages hash,
+	allowing quick retrieval when the same or similar inputs are seen again.
+	"""
+	
+	def __init__(self, max_cache_size: int = 100, enable_cache: bool = True):
+		"""Initialize the agent cache.
+		
+		Args:
+			max_cache_size: Maximum number of entries to store in the cache
+			enable_cache: Whether to enable caching
+		"""
+		self.cache: Dict[str, AgentOutput] = {}
+		self.max_cache_size = max_cache_size
+		self.enable_cache = enable_cache
+		self.hits = 0
+		self.misses = 0
+	
+	def _generate_cache_key(self, messages: list[BaseMessage]) -> str:
+		"""Generate a unique cache key from the input messages.
+		
+		Args:
+			messages: List of messages to hash for the cache key
+		
+		Returns:
+			A string hash representing the input messages
+		"""
+		# Create a stable representation of the messages
+		message_texts = []
+		
+		for msg in messages:
+			# Handle different message content types
+			if isinstance(msg.content, str):
+				message_texts.append(f"{msg.__class__.__name__}:{msg.content}")
+			elif isinstance(msg.content, list):
+				# For multi-modal content (text + images), just use text parts
+				text_parts = []
+				for part in msg.content:
+					if isinstance(part, dict) and part.get('type') == 'text':
+						text_parts.append(part.get('text', ''))
+				message_texts.append(f"{msg.__class__.__name__}:{''.join(text_parts)}")
+		
+		# Create a stable representation and hash it
+		combined = "|||".join(message_texts)
+		return hashlib.sha256(combined.encode()).hexdigest()
+	
+	def get(self, messages: list[BaseMessage]) -> Optional[AgentOutput]:
+		"""Get a cached response if available.
+		
+		Args:
+			messages: The input messages to check in the cache
+			
+		Returns:
+			The cached AgentOutput if found, None otherwise
+		"""
+		if not self.enable_cache:
+			self.misses += 1
+			return None
+		
+		key = self._generate_cache_key(messages)
+		if key in self.cache:
+			self.hits += 1
+			logger.info(f"🔄 Cache hit ({self.hits} hits / {self.misses} misses)")
+			return self.cache[key]
+		
+		self.misses += 1
+		return None
+	
+	def put(self, messages: list[BaseMessage], output: AgentOutput) -> None:
+		"""Store a response in the cache.
+		
+		Args:
+			messages: The input messages used as the cache key
+			output: The LLM output to store
+		"""
+		if not self.enable_cache:
+			return
+		
+		key = self._generate_cache_key(messages)
+		
+		# If cache is full, remove a random entry
+		if len(self.cache) >= self.max_cache_size:
+			# Remove oldest entry (simple implementation)
+			self.cache.pop(next(iter(self.cache)))
+		
+		self.cache[key] = output
+		logger.debug(f"Cache store: {key[:8]}... (cache size: {len(self.cache)})")
+	
+	def clear(self) -> None:
+		"""Clear the cache."""
+		self.cache = {}
+		self.hits = 0
+		self.misses = 0
+	
+	def get_stats(self) -> Dict[str, Any]:
+		"""Get cache statistics.
+		
+		Returns:
+			Dictionary with cache statistics
+		"""
+		total_requests = self.hits + self.misses
+		hit_rate = (self.hits / total_requests) * 100 if total_requests > 0 else 0
+		
+		return {
+			"size": len(self.cache),
+			"max_size": self.max_cache_size,
+			"hits": self.hits,
+			"misses": self.misses,
+			"hit_rate": f"{hit_rate:.2f}%",
+			"enabled": self.enable_cache
+		}
 
 
 def log_response(response: AgentOutput) -> None:
@@ -124,6 +240,9 @@ class Agent(Generic[Context]):
 		page_extraction_llm: Optional[BaseChatModel] = None,
 		planner_llm: Optional[BaseChatModel] = None,
 		planner_interval: int = 1,  # Run planner every N steps
+		# Cache settings
+		enable_cache: bool = True,
+		max_cache_size: int = 100,
 		# Inject state
 		injected_agent_state: Optional[AgentState] = None,
 		#
@@ -158,7 +277,12 @@ class Agent(Generic[Context]):
 			page_extraction_llm=page_extraction_llm,
 			planner_llm=planner_llm,
 			planner_interval=planner_interval,
+			enable_cache=enable_cache,
+			max_cache_size=max_cache_size,
 		)
+		
+		# Initialize cache
+		self.cache = AgentCache(max_cache_size=max_cache_size, enable_cache=enable_cache)
 
 		# Initialize state
 		self.state = injected_agent_state or AgentState()
@@ -336,15 +460,18 @@ class Agent(Generic[Context]):
 
 			await self._raise_if_stopped_or_paused()
 
-			self._message_manager.add_state_message(state, self.state.last_result, step_info, self.settings.use_vision)
+			message = self._message_manager.add_state_message(state, self.state.last_result, step_info, self.settings.use_vision)
+			logger.info(f"Self: str{self}")
 
 			# Run planner at specified intervals if planner is configured
 			if self.settings.planner_llm and self.state.n_steps % self.settings.planner_interval == 0:
+				logger.info ("Running Planner")
 				plan = await self._run_planner()
 				# add plan before last state message
 				self._message_manager.add_plan(plan, position=-1)
 
 			if step_info and step_info.is_last_step():
+				logger.info ("Last Step")
 				# Add last step warning if needed
 				msg = 'Now comes your last step. Use only the "done" action now. No other actions - so here your action sequence musst have length 1.'
 				msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed.'
@@ -359,6 +486,7 @@ class Agent(Generic[Context]):
 
 			try:
 				model_output = await self.get_next_action(input_messages)
+				logger.info ('Model output:' + str(model_output))
 
 				self.state.n_steps += 1
 
@@ -397,6 +525,7 @@ class Agent(Generic[Context]):
 			]
 			return
 		except Exception as e:
+			logger.info("Exception in step" + str(e))
 			result = await self._handle_step_error(e)
 			self.state.last_result = result
 
@@ -503,8 +632,16 @@ class Agent(Generic[Context]):
 		"""Get next action from LLM based on current state"""
 		input_messages = self._convert_input_messages(input_messages)
 
+		# Check cache first
+		cached_output = self.cache.get(input_messages)
+		if cached_output:
+			logger.info("Using cached response for this input")
+			return cached_output
+			
+		# Not in cache, proceed with LLM call
 		if self.tool_calling_method == 'raw':
 			output = self.llm.invoke(input_messages)
+			logger.info ('Output:' + str(output))
 			# TODO: currently invoke does not return reasoning_content, we should override invoke
 			output.content = self._remove_think_tags(str(output.content))
 			try:
@@ -516,6 +653,7 @@ class Agent(Generic[Context]):
 
 		elif self.tool_calling_method is None:
 			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
+			logger.info ('Structured LLM:' + str(structured_llm))
 			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
 			parsed: AgentOutput | None = response['parsed']
 		else:
@@ -531,12 +669,41 @@ class Agent(Generic[Context]):
 			parsed.action = parsed.action[: self.settings.max_actions_per_step]
 
 		log_response(parsed)
+		
+		# Store in cache
+		self.cache.put(input_messages, parsed)
 
 		return parsed
 
+	def get_cache_stats(self) -> Dict[str, Any]:
+		"""Return statistics about the cache usage."""
+		return self.cache.get_stats()
+		
+	def clear_cache(self) -> None:
+		"""Clear the cache."""
+		logger.info("Clearing agent cache")
+		self.cache.clear()
+		
+	def set_cache_enabled(self, enabled: bool) -> None:
+		"""Enable or disable the cache."""
+		logger.info(f"{'Enabling' if enabled else 'Disabling'} agent cache")
+		self.cache.enable_cache = enabled
+		self.settings.enable_cache = enabled
+		
+	def print_cache_stats(self) -> None:
+		"""Print cache statistics to the logger."""
+		stats = self.get_cache_stats()
+		logger.info(f"Cache statistics:")
+		logger.info(f"  Enabled: {stats['enabled']}")
+		logger.info(f"  Size: {stats['size']} / {stats['max_size']}")
+		logger.info(f"  Hits: {stats['hits']}")
+		logger.info(f"  Misses: {stats['misses']}")
+		logger.info(f"  Hit rate: {stats['hit_rate']}")
+		
 	def _log_agent_run(self) -> None:
 		"""Log the agent run"""
 		logger.info(f'🚀 Starting task: {self.task}')
+		logger.debug(f'Cache enabled: {self.settings.enable_cache}, Cache size: {self.settings.max_cache_size}')
 
 		logger.debug(f'Version: {self.version}, Source: {self.source}')
 		self.telemetry.capture(
@@ -615,6 +782,9 @@ class Agent(Generic[Context]):
 
 			return self.state.history
 		finally:
+						# Get cache statistics
+			cache_stats = self.get_cache_stats()
+			
 			self.telemetry.capture(
 				AgentEndTelemetryEvent(
 					agent_id=self.state.agent_id,
@@ -625,6 +795,9 @@ class Agent(Generic[Context]):
 					errors=self.state.history.errors(),
 					total_input_tokens=self.state.history.total_input_tokens(),
 					total_duration_seconds=self.state.history.total_duration_seconds(),
+					cache_enabled=self.settings.enable_cache,
+					cache_hits=cache_stats["hits"],
+					cache_misses=cache_stats["misses"],
 				)
 			)
 

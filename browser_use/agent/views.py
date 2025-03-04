@@ -58,6 +58,10 @@ class AgentSettings(BaseModel):
 	page_extraction_llm: Optional[BaseChatModel] = None
 	planner_llm: Optional[BaseChatModel] = None
 	planner_interval: int = 1  # Run planner every N steps
+	
+	# Cache settings
+	enable_cache: bool = True
+	max_cache_size: int = 100  # Maximum number of entries to store in the cache
 
 
 class AgentState(BaseModel):
